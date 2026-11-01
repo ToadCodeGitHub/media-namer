@@ -41,13 +41,30 @@ class Tools:
         found = shutil.which(name)
         if found:
             return found
-        # WinGet / common installs that aren't always on PATH
-        for base in (os.environ.get("LOCALAPPDATA", ""), r"C:\ffmpeg", r"C:\Program Files\ffmpeg"):
-            for sub in ("bin", ""):
-                cand = os.path.join(base, sub, name + ".exe") if base else ""
-                if cand and os.path.isfile(cand):
-                    return cand
+        # Installs that aren't on this process's PATH yet (e.g. winget ran after VS Code started).
+        for cand in Tools._windows_candidates(name):
+            if os.path.isfile(cand):
+                return cand
         return None
+
+    @staticmethod
+    def _windows_candidates(name: str) -> list[str]:
+        import glob
+        exe = name + ".exe"
+        local = os.environ.get("LOCALAPPDATA", "")
+        home = os.environ.get("USERPROFILE", "")
+        out = []
+        if local:
+            winget = os.path.join(local, "Microsoft", "WinGet")
+            out.append(os.path.join(winget, "Links", exe))
+            out += sorted(glob.glob(os.path.join(winget, "Packages", "*FFmpeg*", "*", "bin", exe)), reverse=True)
+            out += sorted(glob.glob(os.path.join(winget, "Packages", "*FFmpeg*", "bin", exe)), reverse=True)
+        if home:
+            out.append(os.path.join(home, "scoop", "shims", exe))
+        out += [os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "chocolatey", "bin", exe),
+                os.path.join(r"C:\ffmpeg", "bin", exe),
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "ffmpeg", "bin", exe)]
+        return out
 
     @property
     def ok(self) -> bool:

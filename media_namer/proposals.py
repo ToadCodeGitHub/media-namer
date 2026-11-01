@@ -20,9 +20,10 @@ def recompute(items: list[MediaItem], template: str = DEFAULT_TEMPLATE,
     itself being renamed. Names typed by hand are kept as-is (the final check
     before renaming reports any clash).
     """
+    needs_desc = "{desc}" in (template or DEFAULT_TEMPLATE)   # e.g. "{date} {orig}" needs no AI
     sources = set()                       # files that will move out of the way
     for it in items:
-        if it.include and (it.description or (it.name_overridden and it.new_name)):
+        if it.include and (it.description or not needs_desc or (it.name_overridden and it.new_name)):
             sources.add(_key(it.path))
             sources.update(_key(c) for c in it.companions)
 
@@ -34,7 +35,7 @@ def recompute(items: list[MediaItem], template: str = DEFAULT_TEMPLATE,
     for it in items:
         if it.name_overridden:
             continue
-        if not it.description:
+        if needs_desc and not it.description:
             it.new_name = ""
             continue
         stem = build_stem(template, format_date(it.date, date_format), it.description, it.stem)

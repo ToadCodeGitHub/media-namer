@@ -112,7 +112,8 @@ class SettingsDialog(QDialog):
         form.addRow("Files at a time", self.gemini_par)
         form.addRow(self._heading("Naming"))
         form.addRow("Name template", self.template)
-        form.addRow("", self._hint("{date}, {desc}, {orig} (original name). Default: {date} {desc}"))
+        form.addRow("", self._hint("{date}, {desc} (AI), {orig} (current name). Default: {date} {desc}\n"
+                                   "Use {date} {orig} to just add dates to files that already have good names."))
         form.addRow("Date format", self.date_format)
         form.addRow("", self._hint("Python strftime, e.g. %Y-%m-%d or %Y-%m-%d %H%M"))
         form.addRow("Video frames sent", self.frames)

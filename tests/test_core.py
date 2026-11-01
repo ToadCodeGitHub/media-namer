@@ -403,3 +403,25 @@ def test_gemini_backend_with_fake_client(monkeypatch):
 def test_gemini_needs_key():
     with pytest.raises(describe.DescribeError, match="API key"):
         describe.GeminiBackend("", "m")
+
+
+def test_finds_winget_ffmpeg_not_on_path(tmp_path, monkeypatch):
+    from media_namer import media as m
+    pkg = tmp_path / "Microsoft" / "WinGet" / "Packages" / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe" / "ffmpeg-8.0-full_build" / "bin"
+    pkg.mkdir(parents=True)
+    for exe in ("ffmpeg.exe", "ffprobe.exe"):
+        (pkg / exe).write_bytes(b"MZ")
+    monkeypatch.setattr(m.shutil, "which", lambda name: None)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    t = m.Tools()
+    assert t.ok and t.ffmpeg == str(pkg / "ffmpeg.exe")
+
+
+def test_template_without_desc_needs_no_ai(tmp_path):
+    a = item(tmp_path, "Allison feeding ostrich.mp4", "", date=datetime(2024, 12, 26, 11, 52))
+    b = item(tmp_path, "La Grange 10 Robot Runs.MP4", "", date=datetime(2019, 4, 16))
+    proposals.recompute([a, b], template="{date} {orig}")
+    assert a.new_name == "2024-12-26 Allison feeding ostrich.mp4"
+    assert b.new_name == "2019-04-16 La Grange 10 Robot Runs.mp4"
+    ops = renamer.plan([a, b])
+    assert len(ops) == 2 and renamer.validate(ops) == []

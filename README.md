@@ -104,7 +104,7 @@ New name, Date or include columns in Excel, then use File → Import edits.
 | What | How |
 |---|---|
 | Date | Camera metadata first: EXIF for photos, `creation_time` for videos (or Apple's local-time tag when present). Then a date in the file name (`IMG_20191225_083015`, `PXL_…`, `IMG-20190704-WA0001`). Last, the file's modified time, shown in amber. |
-| Name | Template `{date} {desc}`; `{orig}` (the original name) is also available. The date format is `%Y-%m-%d`. Both can be changed in Settings. The extension is lower-cased. |
+| Name | Template `{date} {desc}`; `{orig}` (the original name) is also available. A template without `{desc}`, such as `{date} {orig}`, names files immediately with no AI, which suits files that already have good names. The date format is `%Y-%m-%d`. Both can be changed in Settings. The extension is lower-cased. |
 | Thumbnails | An image with the same name as a video in the same folder (`clip.mp4` + `clip.jpg`) is renamed together with the video and isn't described separately. With **Create thumbnails** on, videos without one get a new `.jpg` from the chosen frame. |
 | Already named | Files that start with `YYYY-MM-DD ` are listed but unchecked. |
 | Name clashes | Duplicates get ` (2)`, ` (3)`, and so on. Swaps (A→B, B→A) and case-only changes work. |
