@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Media Namer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "media_namer",
+            "justMyCode": true,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Media Namer (Gemini key from .env)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "media_namer",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug current test file",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": ["${file}", "-q"],
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        }
+    ]
+}
