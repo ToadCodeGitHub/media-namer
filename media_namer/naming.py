@@ -44,6 +44,27 @@ def clean_description(text: str | None, max_words: int = 10, max_len: int = 70) 
     return line
 
 
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def ensure_names(desc: str, names: list[str]) -> str:
+    """Make sure the people face recognition found are in the title.
+
+    None mentioned:  "Allison and Anika - Children picking apples"
+    Some mentioned:  "Allison picking apples with Anika"
+    """
+    if not desc or not names:
+        return desc
+    low = desc.casefold()
+    missing = [n for n in names if n.casefold() not in low]
+    if not missing:
+        return desc
+    if len(missing) == len(names):
+        return f"{_and(missing)} - {desc}"
+    return f"{desc} with {_and(missing)}"
+
+
 def tidy_user_text(text: str) -> str:
     """Light cleanup for text typed by hand: keep the wording, drop illegal characters."""
     text = _INVALID.sub(" ", text or "")

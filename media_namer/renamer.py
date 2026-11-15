@@ -230,5 +230,5 @@ def describe_log(log_path: str) -> list[str]:
         if act == MOVE and not b.endswith(".tmp"):
             out.append(f"{os.path.basename(b)}  →  {os.path.basename(original.get(a, a))}")
         elif act == CREATE:
-            out.append(f"delete thumbnail {os.path.basename(b)}")
+            out.append(f"delete {os.path.basename(b)}")
     return out

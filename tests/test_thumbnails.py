@@ -82,7 +82,7 @@ def test_plan_apply_undo_creates_thumbnail(tmp_path):
     thumb = media_dir / "2020-05-06 Cake.jpg"
     im = Image.open(thumb)
     assert im.size == (400, 225) and im.getpixel((10, 10))[0] > 200          # the red frame
-    assert "delete thumbnail 2020-05-06 Cake.jpg" in renamer.describe_log(str(log))
+    assert "delete 2020-05-06 Cake.jpg" in renamer.describe_log(str(log))
     restored, problems = renamer.undo(str(log))
     assert problems == [] and not thumb.exists() and (media_dir / "clip.mp4").exists()
 

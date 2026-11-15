@@ -4,7 +4,8 @@ from __future__ import annotations
 import csv
 import os
 
-from .naming import DEFAULT_DATE_FORMAT, DEFAULT_TEMPLATE, build_stem, format_date, with_counter
+from .naming import (ALREADY_NAMED, DEFAULT_DATE_FORMAT, DEFAULT_TEMPLATE, build_stem, format_date,
+                     with_counter)
 from .scan import MediaItem
 
 
@@ -37,6 +38,9 @@ def recompute(items: list[MediaItem], template: str = DEFAULT_TEMPLATE,
             continue
         if needs_desc and not it.description:
             it.new_name = ""
+            continue
+        if not needs_desc and ALREADY_NAMED.match(it.name):
+            it.new_name = it.name              # don't add a second date
             continue
         stem = build_stem(template, format_date(it.date, date_format), it.description, it.stem)
         ext = it.ext.lower()

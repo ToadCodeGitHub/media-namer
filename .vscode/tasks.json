@@ -12,7 +12,7 @@
             "label": "Install dependencies",
             "type": "process",
             "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-            "args": ["-m", "pip", "install", "-e", ".[gemini,heic,dev]"],
+            "args": ["-m", "pip", "install", "-e", ".[gemini,heic,faces,dev]"],
             "dependsOn": "Create virtual environment",
             "problemMatcher": []
         },

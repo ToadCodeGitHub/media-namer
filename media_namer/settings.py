@@ -5,10 +5,10 @@ import hashlib
 import os
 
 from PySide6.QtCore import QSettings, QStandardPaths
-from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QSpinBox, QWidget)
 
-from . import describe
+from . import describe, encode
 from .naming import DEFAULT_DATE_FORMAT, DEFAULT_TEMPLATE
 
 
@@ -32,7 +32,8 @@ class Prefs:
         "ollama/parallel": 1,
         "gemini/key": "",
         "gemini/model": describe.DEFAULT_GEMINI_MODEL,
-        "gemini/parallel": 4,
+        "gemini/parallel": 2,
+        "gemini/rpm": 10,
         "ffmpeg": "",
         "ffprobe": "",
         "template": DEFAULT_TEMPLATE,
@@ -42,6 +43,17 @@ class Prefs:
         "recursive": True,
         "make_thumbs": False,
         "thumb_width": 640,
+        "action": "rename",
+        "export/size": 1080,
+        "export/crf": 23,
+        "export/preset": "veryfast",
+        "export/audio": 160,
+        "export/photos": True,
+        "export/mirror": True,
+        "faces/enabled": False,
+        "faces/threshold": 0.40,
+        "faces/frames": 8,
+        "faces/force_names": True,
     }
 
     def __init__(self):
@@ -52,6 +64,11 @@ class Prefs:
         value = self.q.value(key, default)
         if isinstance(default, bool):
             return value in (True, "true", "1", 1)
+        if isinstance(default, float):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
         if isinstance(default, int):
             try:
                 return int(value)
@@ -110,6 +127,12 @@ class SettingsDialog(QDialog):
         note.setStyleSheet("color: palette(placeholder-text);")
         form.addRow("", note)
         form.addRow("Files at a time", self.gemini_par)
+        self.gemini_rpm = self._spin(prefs.get("gemini/rpm"), 0, 2000)
+        self.gemini_rpm.setSpecialValueText("No limit")
+        self.gemini_rpm.setSuffix(" per minute")
+        form.addRow("Max requests", self.gemini_rpm)
+        form.addRow("", self._hint("Keeps under Gemini's per-minute limit. See your limits at\n"
+                                   "aistudio.google.com/rate-limit; the free tier is low, billing raises it."))
         form.addRow(self._heading("Naming"))
         form.addRow("Name template", self.template)
         form.addRow("", self._hint("{date}, {desc} (AI), {orig} (current name). Default: {date} {desc}\n"
@@ -118,6 +141,36 @@ class SettingsDialog(QDialog):
         form.addRow("", self._hint("Python strftime, e.g. %Y-%m-%d or %Y-%m-%d %H%M"))
         form.addRow("Video frames sent", self.frames)
         form.addRow("Thumbnail size", self.thumb_width)
+        form.addRow(self._heading("Web copies (Export)"))
+        self.crf = self._spin(prefs.get("export/crf"), 16, 32)
+        form.addRow("Quality (CRF)", self.crf)
+        form.addRow("", self._hint("Lower = better and bigger. 20 is near-original, 23 is a good default, 26 is small."))
+        self.preset = QComboBox()
+        self.preset.addItems(encode.PRESETS)
+        self.preset.setCurrentText(prefs.get("export/preset"))
+        form.addRow("Speed", self.preset)
+        form.addRow("", self._hint("veryfast is quick; slower settings make slightly smaller files and take 2-4x longer."))
+        self.audio = QComboBox()
+        for k in (128, 160, 192, 256):
+            self.audio.addItem(f"{k} kbps", k)
+        self.audio.setCurrentIndex(max(0, self.audio.findData(prefs.get("export/audio"))))
+        form.addRow("Audio", self.audio)
+        form.addRow(self._heading("Face recognition"))
+        self.face_thr = QDoubleSpinBox()
+        self.face_thr.setRange(0.30, 0.70)
+        self.face_thr.setSingleStep(0.02)
+        self.face_thr.setDecimals(2)
+        self.face_thr.setValue(prefs.get("faces/threshold"))
+        form.addRow("Match strictness", self.face_thr)
+        self.face_frames = self._spin(prefs.get("faces/frames"), 1, 30)
+        form.addRow("Frames scanned per video", self.face_frames)
+        form.addRow("", self._hint("Only for finding faces (on this PC); doesn't slow the AI. More = more faces found."))
+        from PySide6.QtWidgets import QCheckBox
+        self.force_names = QCheckBox("Always put recognized names in the title")
+        self.force_names.setChecked(prefs.get("faces/force_names"))
+        form.addRow("", self.force_names)
+        form.addRow("", self._hint("Higher = fewer wrong names but more missed faces. 0.40 is a cautious default;\n"
+                                   "use People… → Test a photo to see the scores for your family."))
         form.addRow(self._heading("Tools (blank = find on PATH)"))
         form.addRow("ffmpeg", self.ffmpeg[0])
         form.addRow("ffprobe", self.ffprobe[0])
@@ -168,10 +221,17 @@ class SettingsDialog(QDialog):
         p.set("ollama/parallel", self.ollama_par.value())
         p.set("gemini/key", self.gemini_key.text().strip())
         p.set("gemini/parallel", self.gemini_par.value())
+        p.set("gemini/rpm", self.gemini_rpm.value())
         p.set("template", self.template.text().strip() or DEFAULT_TEMPLATE)
         p.set("date_format", self.date_format.text().strip() or DEFAULT_DATE_FORMAT)
         p.set("frames", self.frames.value())
         p.set("thumb_width", self.thumb_width.value())
+        p.set("export/crf", self.crf.value())
+        p.set("faces/threshold", round(self.face_thr.value(), 2))
+        p.set("faces/frames", self.face_frames.value())
+        p.set("faces/force_names", self.force_names.isChecked())
+        p.set("export/preset", self.preset.currentText())
+        p.set("export/audio", self.audio.currentData())
         p.set("ffmpeg", self.ffmpeg[1].text().strip())
         p.set("ffprobe", self.ffprobe[1].text().strip())
         super().accept()

@@ -38,6 +38,7 @@ class MediaItem:
     make_thumb: bool = False                      # create <new name>.jpg from a frame when renaming
     frames: list[str] = field(default_factory=list)   # cached frame JPEGs (videos)
     thumb_choice: int = -1                        # which frame becomes the thumbnail
+    people: list[str] = field(default_factory=list)   # names found by face recognition
 
     @property
     def name(self) -> str:

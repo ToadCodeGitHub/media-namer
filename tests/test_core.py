@@ -425,3 +425,21 @@ def test_template_without_desc_needs_no_ai(tmp_path):
     assert b.new_name == "2019-04-16 La Grange 10 Robot Runs.mp4"
     ops = renamer.plan([a, b])
     assert len(ops) == 2 and renamer.validate(ops) == []
+
+
+def test_export_mode_column_shows_mp4(tmp_path):
+    import os as _os
+    _os.environ["QT_QPA_PLATFORM"] = _os.environ.get("QT_QPA_PLATFORM") or "offscreen"
+    from PySide6.QtWidgets import QApplication
+    from media_namer.table import COL_NEW, ItemModel
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    v = item(tmp_path, "C0001.MOV", "Robot runs")
+    proposals.recompute([v])
+    m = ItemModel()
+    m.set_items([v], str(tmp_path))
+    assert m.data(m.index(0, COL_NEW)) == "2020-05-06 Robot runs.mov"
+    m.export_mode = True
+    assert m.data(m.index(0, COL_NEW)) == "2020-05-06 Robot runs.mp4"
+    assert m.setData(m.index(0, COL_NEW), "Team practice.mp4")      # typing the .mp4 name works
+    assert v.new_name == "Team practice.mov"
+    assert m.data(m.index(0, COL_NEW)) == "Team practice.mp4"

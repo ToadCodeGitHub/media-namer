@@ -17,7 +17,7 @@ try:  # Optional: lets Pillow open iPhone .heic photos.
 except ImportError:
     HEIC_SUPPORT = False
 
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".mts", ".m2ts", ".wmv", ".mpg", ".mpeg"}
+VIDEO_EXTS = {".dv", ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".mts", ".m2ts", ".wmv", ".mpg", ".mpeg"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".gif"}
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -103,14 +103,15 @@ def duration_of(info: dict) -> float:
 
 
 def video_frames(tools: Tools, path: str, count: int = 3, size: int = 768,
-                 info: dict | None = None) -> list[bytes]:
-    """JPEG frames spread across the video (start, middle, end)."""
+                 info: dict | None = None, spread: tuple[float, float] = (0.15, 0.85)) -> list[bytes]:
+    """JPEG frames spread across the video (by default from 15% to 85% of the way through)."""
     if not tools.ffmpeg:
         raise MediaError("ffmpeg not found")
     info = info if info is not None else probe(tools, path)
     dur = duration_of(info)
     if dur > 2 and count > 1:
-        times = [dur * (0.15 + 0.7 * i / (count - 1)) for i in range(count)]
+        lo, hi = spread
+        times = [dur * (lo + (hi - lo) * i / (count - 1)) for i in range(count)]
     elif dur > 2:
         times = [dur / 2]
     else:
@@ -133,7 +134,10 @@ def _grab_frame(tools: Tools, path: str, t: float, size: int) -> bytes | None:
     try:
         out = subprocess.run(
             [tools.ffmpeg, "-v", "error", "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
-             "-vf", f"scale=w={size}:h={size}:force_original_aspect_ratio=decrease",
+             # Deinterlace (DV tape), square up non-square pixels, then fit the size.
+             "-vf", ("yadif=mode=send_frame:deint=interlaced,"
+                     "scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,"
+                     f"scale=w='min({size},iw)':h='min({size},ih)':force_original_aspect_ratio=decrease"),
              "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "4", "-"],
             capture_output=True, timeout=60, creationflags=_NO_WINDOW,
         )
@@ -163,6 +167,13 @@ def images_for(tools: Tools, path: str, kind: str, frames: int = 3) -> list[byte
     if kind == "video":
         return video_frames(tools, path, count=frames)
     return [photo_jpeg(path)]
+
+
+def face_images(tools: Tools, path: str, kind: str, count: int = 8) -> list[bytes]:
+    """Images for face recognition: more frames and higher resolution than the AI gets."""
+    if kind == "video":
+        return video_frames(tools, path, count=count, size=1280, spread=(0.05, 0.95))
+    return [photo_jpeg(path, size=1600)]
 
 
 def preview_image(tools: Tools, path: str, kind: str) -> bytes:

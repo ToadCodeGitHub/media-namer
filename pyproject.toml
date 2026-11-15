@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 gemini = ["google-genai>=1.0"]
 heic = ["pillow-heif>=0.16"]
+faces = ["opencv-python-headless>=4.8", "numpy"]
 dev = ["pytest>=8"]
 
 [project.scripts]

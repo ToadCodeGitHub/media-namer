@@ -40,6 +40,7 @@ class ItemModel(QAbstractTableModel):
         super().__init__(parent)
         self.items: list[MediaItem] = []
         self.root = ""
+        self.export_mode = False              # New name column shows the web copy's name (.mp4)
         self.on_changed = lambda: None
         style = QApplication.style()
         self._icons = {"video": style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay),
@@ -60,6 +61,8 @@ class ItemModel(QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal:
             if role == Qt.ItemDataRole.DisplayRole:
+                if section == COL_NEW and self.export_mode:
+                    return "Web copy name"
                 return HEADERS[section]
             if role == Qt.ItemDataRole.ToolTipRole:
                 return {COL_INCLUDE: "Rename this file",
@@ -116,6 +119,9 @@ class ItemModel(QAbstractTableModel):
             if col == COL_DESC:
                 return it.description
             if col == COL_NEW:
+                if self.export_mode and it.include:
+                    stem = os.path.splitext(it.new_name)[0] if it.new_name else it.stem
+                    return stem + (".mp4" if it.kind == "video" else it.ext.lower())
                 return it.new_name
             if col == COL_STATUS:
                 return it.status
@@ -169,7 +175,11 @@ class ItemModel(QAbstractTableModel):
             if not name:
                 it.name_overridden = False
             else:
-                if os.path.splitext(name)[1].lower() != it.ext.lower():
+                ext = os.path.splitext(name)[1].lower()
+                if it.kind == "video" and ext == ".mp4" and it.ext.lower() != ".mp4":
+                    name = os.path.splitext(name)[0]          # typed the web copy's name
+                    ext = ""
+                if ext != it.ext.lower():
                     name += it.ext.lower()
                 it.new_name, it.name_overridden = name, True
         elif col == COL_DATE:

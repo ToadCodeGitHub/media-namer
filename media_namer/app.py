@@ -15,16 +15,17 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QMessageBox, QProgressBar, QProgressDialog, QPushButton, QSizePolicy,
                                QSplitter, QTableView, QToolButton, QVBoxLayout, QWidget)
 
-from . import __version__, describe, media, proposals, renamer
+from . import __version__, describe, encode, export, faces, media, proposals, renamer
 from .cache import DescriptionCache
 from .framestore import FrameStore
-from .naming import clean_description
+from .naming import clean_description, ensure_names
 from .scan import (STATUS_ALREADY, STATUS_CACHED, STATUS_DONE, STATUS_ERROR, STATUS_QUEUED,
                    STATUS_RENAMED, STATUS_WORKING, MediaItem)
 from .settings import Prefs, SettingsDialog, data_dir, logs_dir
 from .table import (COL_DATE, COL_DESC, COL_FILE, COL_INCLUDE, COL_NEW, COL_SOURCE, COL_STATUS,
                     FILTER_NAMES, ItemFilter, ItemModel)
-from .workers import DescribeJob, FramesJob, ModelListJob, PreviewJob, ScanJob, load_frames
+from .workers import (DescribeJob, ExportJob, FramesJob, ModelListJob, PreviewJob, ScanJob, SplitJob,
+                      load_frames)
 
 
 class MainWindow(QMainWindow):
@@ -36,6 +37,9 @@ class MainWindow(QMainWindow):
         self.cache = DescriptionCache(os.path.join(data_dir(), "descriptions.json"))
         self.tools = media.Tools(self.prefs.get("ffmpeg"), self.prefs.get("ffprobe"))
         self.frame_store = FrameStore(os.path.join(data_dir(), "frames"))
+        self.people = faces.PeopleLibrary(os.path.join(data_dir(), "people"))
+        self.face_models_dir = os.path.join(data_dir(), "face-models")
+        self._identifier: faces.FaceIdentifier | None = None
         self.frame_store.cleanup()
 
         self.gen = 0                                   # bumps on each scan; stale results are ignored
@@ -48,6 +52,11 @@ class MainWindow(QMainWindow):
         self.batch_total = 0
         self.batch_failed = 0
         self.scanning = False
+        self.exporting = False
+        self.export_cancel = threading.Event()
+        self.splitting = False
+        self.split_cancel = threading.Event()
+        self.export_tasks: list[export.ExportTask] = []
         self.previews: dict[str, bytes] = {}
         self.current_preview = ""
         self.jobs = []                                 # keep job signal objects alive
@@ -60,6 +69,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_prefs()
         self.thumbs_check.toggled.connect(self._thumbs_toggled)
+        self.action_combo.currentIndexChanged.connect(self._action_changed)
+        self.photos_check.toggled.connect(lambda on: (self.prefs.set("export/photos", on), self._update_buttons()))
+        self.mirror_check.toggled.connect(lambda on: self.prefs.set("export/mirror", on))
+        self.size_combo.currentIndexChanged.connect(lambda _: self.prefs.set("export/size", self.size_combo.currentData()))
         self._update_tools_note()
         self._update_buttons()
 
@@ -112,6 +125,13 @@ class MainWindow(QMainWindow):
         row.addWidget(self.privacy)
         row.addSpacing(12)
         row.addWidget(self.context_edit, 1)
+        self.faces_check = QCheckBox("Recognize faces")
+        self.faces_check.toggled.connect(self._faces_toggled)
+        people_btn = QPushButton("People…")
+        people_btn.setToolTip("Add the people to recognize, with a few photos of each")
+        people_btn.clicked.connect(self.open_people)
+        row.addWidget(self.faces_check)
+        row.addWidget(people_btn)
         outer.addLayout(row)
 
         # Row 3: actions
@@ -125,7 +145,13 @@ class MainWindow(QMainWindow):
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop_work)
         self.apply_btn = QPushButton("Rename checked files…")
-        self.apply_btn.clicked.connect(self.apply_renames)
+        self.apply_btn.clicked.connect(self.run_action)
+        self.action_combo = QComboBox()
+        self.action_combo.addItem("Rename originals", "rename")
+        self.action_combo.addItem("Export web copies", "export")
+        self.action_combo.setToolTip("Rename originals: renames the files where they are.\n"
+                                     "Export web copies: leaves originals untouched and writes web-friendly\n"
+                                     "MP4s (and thumbnails) with the new names to another folder.")
         self.thumbs_check = QCheckBox("Create thumbnails")
         self.thumbs_check.setToolTip("For videos without a thumbnail image, save the best frame as a .jpg\n"
                                      "with the same name when renaming. Click a frame in the preview\n"
@@ -142,8 +168,39 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("Show"))
         row.addWidget(self.filter_combo)
         row.addSpacing(12)
+        row.addWidget(self.action_combo)
         row.addWidget(self.apply_btn)
         outer.addLayout(row)
+
+        # Row 4: export options (only in export mode)
+        self.export_row = QWidget()
+        row = QHBoxLayout(self.export_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.out_edit = QLineEdit()
+        self.out_edit.setPlaceholderText("Folder for the web copies (outside the folder being scanned)")
+        out_browse = QPushButton("Browse…")
+        out_browse.clicked.connect(self.browse_output)
+        out_open = QPushButton("Open")
+        out_open.setToolTip("Open the output folder")
+        out_open.clicked.connect(lambda: self.out_edit.text() and os.path.isdir(self.out_edit.text())
+                                 and QDesktopServices.openUrl(QUrl.fromLocalFile(self.out_edit.text())))
+        self.size_combo = QComboBox()
+        for label, h in encode.SIZES:
+            self.size_combo.addItem(label, h)
+        self.size_combo.setToolTip("Largest size of the web copy (short side). Never enlarges.")
+        self.photos_check = QCheckBox("Copy photos")
+        self.mirror_check = QCheckBox("Keep subfolders")
+        self.mirror_check.setToolTip("Recreate the source folder layout inside the output folder")
+        row.addWidget(QLabel("Save web copies to"))
+        row.addWidget(self.out_edit, 1)
+        row.addWidget(out_browse)
+        row.addWidget(out_open)
+        row.addSpacing(12)
+        row.addWidget(QLabel("Size"))
+        row.addWidget(self.size_combo)
+        row.addWidget(self.photos_check)
+        row.addWidget(self.mirror_check)
+        outer.addWidget(self.export_row)
 
         # Table + preview
         self.table = QTableView()
@@ -233,11 +290,13 @@ class MainWindow(QMainWindow):
         self._action(m, "&Open folder…", self.browse_folder, QKeySequence.StandardKey.Open)
         self._action(m, "Re&scan", self.scan_folder, QKeySequence("F5"))
         m.addSeparator()
+        self._action(m, "S&plit DV capture into recordings…", self.split_dv)
+        m.addSeparator()
         self._action(m, "&Export list to CSV…", self.export_csv)
         self._action(m, "&Import edits from CSV…", self.import_csv)
         m.addSeparator()
-        self._action(m, "Undo &last rename…", self.undo_last)
-        self._action(m, "&Undo a rename from a log…", self.undo_from_file)
+        self._action(m, "Undo &last rename or export…", self.undo_last)
+        self._action(m, "&Undo from a log…", self.undo_from_file)
         self._action(m, "Open rename &logs folder", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(logs_dir())))
         m.addSeparator()
         self._action(m, "Se&ttings…", self.open_settings, QKeySequence("Ctrl+,"))
@@ -268,6 +327,15 @@ class MainWindow(QMainWindow):
         self.folder_edit.setText(p.get("folder"))
         self.recursive.setChecked(p.get("recursive"))
         self.thumbs_check.setChecked(p.get("make_thumbs"))
+        self.faces_check.setChecked(p.get("faces/enabled"))
+        self._update_faces_check()
+        self.action_combo.setCurrentIndex(max(0, self.action_combo.findData(p.get("action"))))
+        self.size_combo.setCurrentIndex(max(0, self.size_combo.findData(p.get("export/size"))))
+        self.photos_check.setChecked(p.get("export/photos"))
+        self.mirror_check.setChecked(p.get("export/mirror"))
+        self.out_edit.setText(self._default_output(p.get("folder")))
+        self.export_row.setVisible(self.action() == "export")
+        self.model.export_mode = self.action() == "export"
         idx = self.backend_combo.findData(p.get("backend"))
         self.backend_combo.setCurrentIndex(max(0, idx))
         self._backend_changed()
@@ -293,6 +361,7 @@ class MainWindow(QMainWindow):
         p.set(f"{self.backend()}/model", self.model_combo.currentText().strip())
         if self.model.root:
             p.set_context_for(self.model.root, self.context_edit.text().strip())
+            self._save_output()
         p.q.setValue("window/geometry", self.saveGeometry())
         p.q.setValue("window/splitter", self.splitter.saveState())
         p.q.setValue("window/columns", self.table.horizontalHeader().saveState())
@@ -353,6 +422,7 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         if SettingsDialog(self.prefs, self).exec():
+            self._identifier = None
             self.tools = media.Tools(self.prefs.get("ffmpeg"), self.prefs.get("ffprobe"))
             self._update_tools_note()
             self.recompute()
@@ -371,12 +441,16 @@ class MainWindow(QMainWindow):
             self.scan_folder()
 
     def scan_folder(self) -> None:
+        if self.exporting or self.splitting:
+            QMessageBox.information(self, "Busy", "Wait for the current job to finish, or click Stop.")
+            return
         folder = self.folder_edit.text().strip().strip('"')
         if not folder or not os.path.isdir(folder):
             QMessageBox.warning(self, "Folder not found", f"Can't open this folder:\n{folder}")
             return
         if self.model.root:
             self.prefs.set_context_for(self.model.root, self.context_edit.text().strip())
+            self._save_output()
         self.stop_work()
         self.gen += 1
         self.scan_cancel = threading.Event()
@@ -384,6 +458,7 @@ class MainWindow(QMainWindow):
         self.model.set_items([], "")
         self.previews.clear()
         self.context_edit.setText(self.prefs.context_for(folder))
+        self.out_edit.setText(self._default_output(folder))
         self.prefs.set("folder", folder)
         self.prefs.set("recursive", self.recursive.isChecked())
         job = ScanJob(self.gen, folder, self.recursive.isChecked(), self.tools, self.scan_cancel)
@@ -434,8 +509,60 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Scan failed", error)
 
     def _cache_key(self, it: MediaItem) -> str:
-        return self.cache.key(it.size, it.mtime_ns, self.backend(), self.model_combo.currentText().strip(),
-                              self.context_edit.text())
+        ctx = self.context_edit.text()
+        if self.faces_on():          # different people, strictness or frames -> ask again
+            ctx += (f"|faces:{self.people.fingerprint()}:{self.prefs.get('faces/threshold'):.2f}"
+                    f":{self.prefs.get('faces/frames')}")
+        return self.cache.key(it.size, it.mtime_ns, self.backend(), self.model_combo.currentText().strip(), ctx)
+
+    # ================================================================ faces
+    def _faces_problem(self) -> str:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            return "Needs OpenCV:  pip install opencv-python-headless"
+        if not faces.models_present(self.face_models_dir):
+            return "Open People… and download the face models first."
+        if not self.people.ready():
+            return "Open People… and add at least one person with photos."
+        return ""
+
+    def _update_faces_check(self) -> None:
+        why = self._faces_problem()
+        self.faces_check.setEnabled(not why)
+        self.faces_check.setToolTip(why or "Find the people you added in each video or photo, and give the AI "
+                                           "their names (matching runs on this PC)")
+        if why and self.faces_check.isChecked():
+            self.faces_check.blockSignals(True)
+            self.faces_check.setChecked(False)
+            self.faces_check.blockSignals(False)
+
+    def faces_on(self) -> bool:
+        return self.faces_check.isChecked() and self.faces_check.isEnabled()
+
+    def _faces_toggled(self, on: bool) -> None:
+        self.prefs.set("faces/enabled", on)
+        self._identifier = None
+
+    def identifier(self) -> faces.FaceIdentifier | None:
+        if not self.faces_on():
+            return None
+        thr = self.prefs.get("faces/threshold")
+        if self._identifier is None or self._identifier.threshold != thr:
+            folder = self.face_models_dir
+            self._identifier = faces.FaceIdentifier(self.people, lambda: faces.FaceEngine(folder), thr)
+        return self._identifier
+
+    def open_people(self) -> None:
+        from .people_dialog import PeopleDialog
+        PeopleDialog(self.people, self.face_models_dir, self.prefs.get("faces/threshold"), self).exec()
+        self._identifier = None
+        was = self.faces_check.isChecked()
+        self._update_faces_check()
+        if not was and self.faces_check.isEnabled() and self.people.ready():
+            self.faces_check.setChecked(True)
+        self._apply_cache(self.model.items)
+        self.recompute()
 
     def _apply_cache(self, items: list[MediaItem]) -> None:
         for it in items:
@@ -505,6 +632,9 @@ class MainWindow(QMainWindow):
         parallel = self.prefs.get(f"{cfg['kind']}/parallel")
         self.ai_pool.setMaxThreadCount(max(1, parallel))
         frames = self.prefs.get("frames")
+        face_id = self.identifier()
+        limiter = (describe.RateLimiter.shared(f"gemini:{cfg['gemini_model']}", self.prefs.get("gemini/rpm"))
+                   if cfg["kind"] == describe.GEMINI else None)
         queued = 0
         for r in rows:
             it = self.model.items[r]
@@ -517,7 +647,8 @@ class MainWindow(QMainWindow):
                     continue
             it.status, it.error = STATUS_QUEUED, ""
             job = DescribeJob(self.gen, r, it, cfg, context, self.tools, frames, self.ai_cancel,
-                              store=self.frame_store)
+                              store=self.frame_store, limiter=limiter, faces=face_id,
+                              face_frames=self.prefs.get("faces/frames"))
             s = job.signals
             s.started.connect(self._job_started)
             s.done.connect(self._job_done)
@@ -545,16 +676,19 @@ class MainWindow(QMainWindow):
             self.model.items[row].error = msg
             self.status_label.setText(f"{self.model.items[row].name}: {msg}")
 
-    def _job_done(self, gen: int, row: int, text: str, frames: list) -> None:
+    def _job_done(self, gen: int, row: int, text: str, frames: list, people: list) -> None:
         if not self._row_ok(gen, row):
             return
         it = self.model.items[row]
+        it.people = list(people)
         if frames:
             it.thumb_choice = -1                 # new frames: pick the best again
             self._set_frames(it, frames)
             if it.path == self.current_preview:
                 self._show_frames(it)
         desc = clean_description(text)
+        if desc and it.people and self.prefs.get("faces/force_names"):
+            desc = ensure_names(desc, it.people)
         if desc:
             it.description, it.status, it.error = desc, STATUS_DONE, ""
             it.name_overridden = False
@@ -571,7 +705,8 @@ class MainWindow(QMainWindow):
             self.batch_failed += 1
             self._job_finished()
             # A setup problem (wrong model, Ollama not running) will fail every file - stop early.
-            setup = ("isn't running", "not found", "API key", "HTTP 401", "HTTP 403", "HTTP 404")
+            setup = ("isn't running", "not found", "API key", "HTTP 401", "HTTP 403", "HTTP 404",
+                     "daily limit", "no free quota")
             if any(x in error for x in setup) and not self.ai_cancel.is_set():
                 self.stop_work()
                 QMessageBox.warning(self, "Describing stopped", error)
@@ -608,6 +743,8 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def stop_work(self) -> None:
+        self.split_cancel.set()
+        self.export_cancel.set()
         self.scan_cancel.set()
         self.ai_cancel.set()
         self.ai_pool.clear()                     # drop jobs that haven't started
@@ -791,6 +928,8 @@ class MainWindow(QMainWindow):
             lines.append(f"Taken: {it.date:%Y-%m-%d %H:%M} <i>(from {it.date_source})</i>")
         if it.companions:
             lines.append("Thumbnail: " + ", ".join(_esc(os.path.basename(c)) for c in it.companions))
+        if it.people:
+            lines.append("People (face match): " + ", ".join(_esc(n) for n in it.people))
         elif it.make_thumb:
             lines.append("Thumbnail: <i>will be made from the highlighted frame when renaming</i>")
         if it.new_name and it.new_name != it.name:
@@ -801,10 +940,13 @@ class MainWindow(QMainWindow):
 
     # ================================================================ renaming
     def _update_buttons(self) -> None:
-        busy = self.pending > 0 or self.scanning
+        busy = self.pending > 0 or self.scanning or self.exporting or self.splitting
+        self.scan_btn.setEnabled(not self.exporting)
+        self.action_combo.setEnabled(not self.exporting)
         has = bool(self.model.items)
-        self.describe_btn.setEnabled(has and not self.scanning)
-        self.describe_sel_btn.setEnabled(has and not self.scanning and bool(self.selected_rows()))
+        self.describe_btn.setEnabled(has and not self.scanning and not self.exporting)
+        self.describe_sel_btn.setEnabled(has and not self.scanning and not self.exporting
+                                         and bool(self.selected_rows()))
         self.stop_btn.setEnabled(busy)
         n = len(renamer.plan(self.model.items)) if has else 0
         n_thumbs = sum(1 for it in self.model.items
@@ -814,6 +956,12 @@ class MainWindow(QMainWindow):
         self.apply_btn.setText(f"Rename {files} file{'s' if files != 1 else ''}…" if files else "Rename checked files…")
         self.apply_btn.setToolTip((f"{n} changes, including {n_thumbs} new thumbnail(s)" if n_thumbs
                                    else f"{n} renames including thumbnails") if n else "")
+        if self.action() == "export":
+            k = sum(1 for it in self.model.items
+                    if it.include and (it.kind == "video" or self.photos_check.isChecked()))
+            self.apply_btn.setEnabled(k > 0 and not busy)
+            self.apply_btn.setText(f"Export {k} file{'s' if k != 1 else ''}…" if k else "Export checked files…")
+            self.apply_btn.setToolTip("Originals are not changed")
 
     def _ensure_frames(self, items: list[MediaItem]) -> bool:
         """Grab frames for videos that need a thumbnail but haven't been previewed or described."""
@@ -879,7 +1027,7 @@ class MainWindow(QMainWindow):
         log = self._run_ops(ops)
         if log:
             self.recompute()
-            self.status_label.setText(f"Created {len(ops)} thumbnail(s). Undo with File › Undo last rename.")
+            self.status_label.setText(f"Created {len(ops)} thumbnail(s). Undo with File › Undo last rename or export.")
 
     def apply_renames(self) -> None:
         wanting = [it for it in self.model.items
@@ -906,7 +1054,7 @@ class MainWindow(QMainWindow):
         msg += "?"
         if new_thumbs:
             msg += f"\n\nAlso create {new_thumbs} new thumbnail{'s' if new_thumbs != 1 else ''}."
-        msg += "\n\nA log is saved so you can undo this from File › Undo last rename."
+        msg += "\n\nA log is saved so you can undo this from File › Undo last rename or export."
         if QMessageBox.question(self, "Rename files", msg) != QMessageBox.StandardButton.Yes:
             return
         log = self._run_ops(ops)
@@ -925,7 +1073,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Renamed {files} files{extra}. Log: {log}")
 
     def _latest_log(self) -> str | None:
-        logs = sorted(glob.glob(os.path.join(logs_dir(), "rename-*.csv")), reverse=True)
+        logs = glob.glob(os.path.join(logs_dir(), "rename-*.csv")) + glob.glob(os.path.join(logs_dir(), "export-*.csv"))
+        logs.sort(key=lambda p: os.path.basename(p).split("-", 1)[1], reverse=True)
         for path in logs:
             if not renamer.log_is_undone(path) and renamer.read_log(path):
                 return path
@@ -934,12 +1083,12 @@ class MainWindow(QMainWindow):
     def undo_last(self) -> None:
         log = self._latest_log()
         if not log:
-            QMessageBox.information(self, "Undo", "There's no rename to undo.")
+            QMessageBox.information(self, "Undo", "There's no rename or export to undo.")
             return
         self._undo(log)
 
     def undo_from_file(self) -> None:
-        log, _ = QFileDialog.getOpenFileName(self, "Choose a rename log", logs_dir(), "Rename logs (*.csv)")
+        log, _ = QFileDialog.getOpenFileName(self, "Choose a log", logs_dir(), "Rename and export logs (*.csv)")
         if log:
             self._undo(log)
 
@@ -962,8 +1111,244 @@ class MainWindow(QMainWindow):
             box.setDetailedText("\n".join(problems))
             box.exec()
         else:
-            self.status_label.setText(f"Restored {restored} original file name(s).")
-        if self.model.root:
+            what = "deleted" if os.path.basename(log).startswith("export-") else "restored"
+            self.status_label.setText(f"Undo finished: {restored} file(s) {what}.")
+        if self.model.root and os.path.basename(log).startswith("rename-"):
+            self.scan_folder()
+
+    # ================================================================ export web copies
+    def action(self) -> str:
+        return self.action_combo.currentData()
+
+    def _action_changed(self) -> None:
+        self.prefs.set("action", self.action())
+        self.export_row.setVisible(self.action() == "export")
+        self.model.export_mode = self.action() == "export"
+        self.model.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 6)
+        self.model.refresh_rows()
+        self._update_buttons()
+
+    def run_action(self) -> None:
+        if self.action() == "export":
+            self.start_export()
+        else:
+            self.apply_renames()
+
+    def _default_output(self, folder: str) -> str:
+        if not folder:
+            return ""
+        saved = self.prefs.q.value(f"export/dir/{self.prefs._fkey(folder)}", "")
+        if saved:
+            return str(saved)
+        folder = os.path.normpath(folder)
+        return os.path.join(os.path.dirname(folder), os.path.basename(folder) + " (web)")
+
+    def _save_output(self) -> None:
+        if self.model.root and self.out_edit.text().strip():
+            self.prefs.q.setValue(f"export/dir/{self.prefs._fkey(self.model.root)}", self.out_edit.text().strip())
+
+    def browse_output(self) -> None:
+        start = self.out_edit.text() or self.folder_edit.text() or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "Folder for web copies", start)
+        if folder:
+            self.out_edit.setText(os.path.normpath(folder))
+            self._save_output()
+
+    def encode_options(self) -> encode.EncodeOptions:
+        return encode.EncodeOptions(max_height=int(self.size_combo.currentData() or 0),
+                                    crf=self.prefs.get("export/crf"),
+                                    preset=self.prefs.get("export/preset"),
+                                    audio_kbps=self.prefs.get("export/audio"))
+
+    def start_export(self) -> None:
+        if self.exporting or not self.model.items:
+            return
+        if not self.tools.ok:
+            QMessageBox.warning(self, "ffmpeg needed", "Exporting videos needs ffmpeg and ffprobe.")
+            return
+        out = self.out_edit.text().strip().strip('"')
+        why = export.check_folders(self.model.root, out, self.recursive.isChecked())
+        if why:
+            QMessageBox.warning(self, "Output folder", why)
+            return
+        self._save_output()
+        videos = [it for it in self.model.items if it.include and it.kind == "video"]
+        if self.thumbs_check.isChecked():
+            if not self._ensure_frames([it for it in videos if not it.companions]):
+                return
+        tasks = export.plan_export(self.model.items, self.model.root, out,
+                                   mirror=self.mirror_check.isChecked(), photos=self.photos_check.isChecked(),
+                                   thumbs=self.thumbs_check.isChecked())
+        todo = [t for t in tasks if not t.skip]
+        if not todo:
+            QMessageBox.information(self, "Export", "Everything checked is already in the output folder.")
+            return
+        n_vid = sum(1 for t in todo if t.kind == export.VIDEO)
+        n_photo = sum(1 for t in todo if t.kind == export.PHOTO)
+        n_thumb = sum(1 for t in todo if t.kind == export.THUMB)
+        skipped = len(tasks) - len(todo)
+        o = self.encode_options()
+        lines = [f"Encode {n_vid} video{'s' if n_vid != 1 else ''} to web-friendly MP4 "
+                 f"({self.size_combo.currentText()}, H.264, quality {o.crf}, {o.preset})"]
+        if n_thumb:
+            lines.append(f"Make {n_thumb} thumbnail{'s' if n_thumb != 1 else ''}")
+        if n_photo:
+            lines.append(f"Copy {n_photo} photo{'s' if n_photo != 1 else ''}")
+        if skipped:
+            lines.append(f"Skip {skipped} file{'s' if skipped != 1 else ''} already in the output folder")
+        msg = ("\n".join("• " + ln for ln in lines) + f"\n\ninto:\n{out}\n\n"
+               "Your original files are not changed.")
+        if QMessageBox.question(self, "Export web copies", msg) != QMessageBox.StandardButton.Yes:
+            return
+        self.export_tasks = tasks
+        self.export_weights = [0.0 if t.skip else (1.0 if t.kind == export.VIDEO else 0.02) for t in tasks]
+        self.export_done_w = 0.0
+        self.export_cancel = threading.Event()
+        self.exporting = True
+        for t in tasks:
+            if t.kind != export.THUMB:
+                it = self.model.items[t.item_index]
+                it.status, it.error = ("already exported", "") if t.skip else ("waiting", "")
+        log = os.path.join(logs_dir(), f"export-{datetime.now():%Y%m%d-%H%M%S}.csv")
+        job = ExportJob(tasks, self.tools, o, self.prefs.get("thumb_width"), log, self.export_cancel)
+        job.signals.task_started.connect(self._export_started)
+        job.signals.task_progress.connect(self._export_progress)
+        job.signals.task_done.connect(self._export_task_done)
+        job.signals.finished.connect(self._export_finished)
+        self.jobs.append(job)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self.model.refresh_rows()
+        self._update_buttons()
+        QThreadPool.globalInstance().start(job)
+
+    def _export_status(self, i: int, text: str) -> None:
+        t = self.export_tasks[i]
+        if 0 <= t.item_index < len(self.model.items):
+            it = self.model.items[t.item_index]
+            if t.kind != export.THUMB or text.startswith("error"):
+                it.status = text if not text.startswith("error") else STATUS_ERROR
+            self.model.refresh_rows([t.item_index])
+
+    def _export_started(self, i: int) -> None:
+        t = self.export_tasks[i]
+        name = os.path.basename(t.dst)
+        n = sum(1 for x in self.export_tasks[:i + 1] if x.kind == t.kind and not x.skip)
+        total = sum(1 for x in self.export_tasks if x.kind == t.kind and not x.skip)
+        verb = {"video": "Encoding", "thumb": "Making thumbnail", "photo": "Copying"}[t.kind]
+        self.status_label.setText(f"{verb} {n} of {total}: {name}")
+        if t.kind == export.VIDEO:
+            self._export_status(i, "encoding 0%")
+
+    def _export_progress(self, i: int, frac: float) -> None:
+        total = sum(self.export_weights) or 1
+        self.progress.setValue(int(1000 * (self.export_done_w + self.export_weights[i] * frac) / total))
+        if self.export_tasks[i].kind == export.VIDEO:
+            self._export_status(i, f"encoding {int(frac * 100)}%")
+
+    def _export_task_done(self, i: int, result: str, msg: str) -> None:
+        self.export_done_w += self.export_weights[i]
+        total = sum(self.export_weights) or 1
+        self.progress.setValue(int(1000 * self.export_done_w / total))
+        t = self.export_tasks[i]
+        it = self.model.items[t.item_index] if 0 <= t.item_index < len(self.model.items) else None
+        if result == "done":
+            self._export_status(i, "exported")
+        elif result == "skipped":
+            self._export_status(i, "already exported")
+        elif result == "cancelled":
+            self._export_status(i, "")
+        elif it is not None:
+            what = "thumbnail: " if t.kind == export.THUMB else ""
+            it.error = (it.error + "\n" if it.error else "") + what + msg
+            self._export_status(i, "error")
+
+    def _export_finished(self, log: str, written: int, failed: int, cancelled: bool) -> None:
+        self.exporting = False
+        self.progress.setVisible(False)
+        self._update_buttons()
+        self._show_details()
+        out = self.out_edit.text().strip()
+        parts = [f"Exported {written} file{'s' if written != 1 else ''} to {out}."]
+        if failed:
+            parts.append(f"{failed} failed - hover the Status column.")
+        if cancelled:
+            parts.append("Stopped; the file in progress was discarded.")
+        if written:
+            parts.append("File › Undo last rename or export deletes these copies.")
+        self.status_label.setText(" ".join(parts))
+
+    # ================================================================ DV tape
+    def split_dv(self, files: list[str] | None = None, out: str | None = None) -> None:
+        if self.exporting or self.splitting or self.pending or self.scanning:
+            QMessageBox.information(self, "Busy", "Wait for the current job to finish, or click Stop.")
+            return
+        if not self.tools.ok:
+            QMessageBox.warning(self, "ffmpeg needed", "Splitting DV captures needs ffmpeg.")
+            return
+        if not files:
+            start = self.folder_edit.text() or os.path.expanduser("~")
+            files, _ = QFileDialog.getOpenFileNames(self, "DV captures to split", start,
+                                                    "DV video (*.avi *.dv *.mov);;All files (*)")
+        if not files:
+            return
+        src_dir = os.path.dirname(files[0])
+        suggested = os.path.join(src_dir, "recordings")
+        if not out:
+            out = QFileDialog.getExistingDirectory(self, "Folder for the split recordings", src_dir)
+        if not out:
+            return
+        if any(os.path.normcase(os.path.dirname(f)) == os.path.normcase(out) for f in files):
+            if QMessageBox.question(
+                    self, "Same folder",
+                    "The recordings would go in the same folder as the capture, so the long capture and its "
+                    f"pieces would both be scanned.\n\nUse a 'recordings' subfolder instead?\n{suggested}") \
+                    == QMessageBox.StandardButton.Yes:
+                out = suggested
+        self.split_cancel = threading.Event()
+        self.splitting = True
+        self.split_files, self.split_out, self.split_results, self.split_errors = files, out, [], []
+        job = SplitJob(files, out, self.tools, self.split_cancel)
+        job.signals.progress.connect(self._split_progress)
+        job.signals.file_done.connect(self._split_file_done)
+        job.signals.finished.connect(self._split_finished)
+        self.jobs.append(job)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self._update_buttons()
+        QThreadPool.globalInstance().start(job)
+
+    def _split_progress(self, i: int, frames: int, est: int, scenes: int) -> None:
+        n = len(self.split_files)
+        self.progress.setValue(int(1000 * (i + min(1.0, frames / est)) / n))
+        mins = frames / 29.97 / 60
+        self.status_label.setText(f"Splitting {os.path.basename(self.split_files[i])} ({i + 1} of {n}): "
+                                  f"{mins:.1f} min read, {scenes} recording{'s' if scenes != 1 else ''} so far")
+
+    def _split_file_done(self, i: int, paths: list, error: str) -> None:
+        self.split_results += paths
+        if error and error != "cancelled":
+            self.split_errors.append(f"{os.path.basename(self.split_files[i])}: {error}")
+
+    def _split_finished(self, cancelled: bool) -> None:
+        self.splitting = False
+        self.progress.setVisible(False)
+        self._update_buttons()
+        n = len(self.split_results)
+        msg = f"Created {n} recording{'s' if n != 1 else ''} in {self.split_out}."
+        if cancelled:
+            msg += " Stopped early; the recording in progress was discarded."
+        if self.split_errors:
+            box = QMessageBox(QMessageBox.Icon.Warning, "Split finished with problems", msg, parent=self)
+            box.setDetailedText("\n".join(self.split_errors))
+            box.exec()
+        self.status_label.setText(msg)
+        if n and QMessageBox.question(self, "Split finished",
+                                      msg + "\n\nThe original captures were not changed.\n\nScan the new recordings now?") \
+                == QMessageBox.StandardButton.Yes:
+            self.folder_edit.setText(self.split_out)
             self.scan_folder()
 
     # ================================================================ CSV
@@ -993,6 +1378,17 @@ class MainWindow(QMainWindow):
 
     # ================================================================ close
     def closeEvent(self, e):
+        if self.splitting:
+            self.split_cancel.set()
+            QThreadPool.globalInstance().waitForDone(5000)
+        if self.exporting:
+            if QMessageBox.question(self, "Quit", "An export is running. Stop it and quit?\n"
+                                    "The file being encoded is discarded; finished files are kept.") \
+                    != QMessageBox.StandardButton.Yes:
+                e.ignore()
+                return
+            self.export_cancel.set()
+            QThreadPool.globalInstance().waitForDone(10000)
         if self.pending:
             if QMessageBox.question(self, "Quit", "Descriptions are still running. Stop and quit?") \
                     != QMessageBox.StandardButton.Yes:

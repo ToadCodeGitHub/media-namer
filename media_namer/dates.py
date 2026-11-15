@@ -14,6 +14,7 @@ from PIL import Image
 from .media import MediaError, Tools, probe
 
 SOURCE_CAMERA = "camera"
+SOURCE_TAPE = "tape"            # recording date stamped in DV frames by the camcorder
 SOURCE_FILENAME = "file name"
 SOURCE_MODIFIED = "modified time"
 SOURCE_MANUAL = "manual"
@@ -26,6 +27,8 @@ _DATETIME = 306
 _FILENAME_DATE = re.compile(
     r"(?<!\d)((?:19|20)\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])(?!\d)"
 )
+# DV capture tools (WinDV and similar) append the tape's recording date: name.YY-MM-DD_HH-MM.SS
+_DV_CAPTURE = re.compile(r"(?<!\d)(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})[.\-](\d{2})(?!\d)")
 _FILENAME_TIME = re.compile(r"^[-_. T]?([01]\d|2[0-3])[-_.:]?([0-5]\d)[-_.:]?([0-5]\d)(?:\d{3})?(?!\d)")
 
 
@@ -97,7 +100,15 @@ def filename_date(name: str) -> datetime | None:
     stem = os.path.splitext(os.path.basename(name))[0]
     m = _FILENAME_DATE.search(stem)
     if not m:
-        return None
+        dv = _DV_CAPTURE.search(stem)
+        if not dv:
+            return None
+        yy, mo, d, hh, mi, ss = (int(g) for g in dv.groups())
+        year = 2000 + yy if yy < 80 else 1900 + yy       # DV camcorders: 1995 onwards
+        try:
+            return _plausible(datetime(year, mo, d, hh, mi, ss))
+        except ValueError:
+            return None
     y, mo, d = (int(g) for g in m.groups())
     hh = mm = ss = 0
     t = _FILENAME_TIME.match(stem[m.end():])
@@ -115,7 +126,13 @@ def find_date(tools: Tools, path: str, kind: str, info: dict | None = None) -> t
         dt = photo_date(path)
     elif kind == "video" and tools.ffprobe:
         try:
-            dt = video_date(info if info is not None else probe(tools, path))
+            info = info if info is not None else probe(tools, path)
+            if any(s.get("codec_name") == "dvvideo" for s in info.get("streams", [])):
+                from .dvtape import recording_date
+                tape = recording_date(tools, path)
+                if tape:
+                    return tape, SOURCE_TAPE
+            dt = video_date(info)
         except MediaError:
             dt = None
     if dt:

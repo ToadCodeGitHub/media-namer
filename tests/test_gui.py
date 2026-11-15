@@ -238,3 +238,170 @@ def test_thumbnail_flow(tmp_path, monkeypatch):
     assert (media / "2018-01-01 Already done.mp4").exists()
     w.close()
     srv.shutdown()
+
+
+def test_export_flow(tmp_path, monkeypatch):
+    import hashlib
+    from media_namer.media import probe
+    from tests.test_export import raw_camera_clip
+
+    src = tmp_path / "Video Staging area"
+    src.mkdir()
+    raw_camera_clip(src / "C0001.MOV", size="2560x1440", seconds=2, creation="2024-12-26T19:52:00Z")
+    raw_camera_clip(src / "La Grange 10 Robot Runs.MOV", size="1280x720", seconds=2, creation="2019-04-16T20:49:00Z")
+    Image.new("RGB", (320, 180), "orange").save(src / "La Grange 10 Robot Runs.jpg")
+    exif = Image.Exif()
+    exif.get_ifd(0x8769)[36867] = "2024:12:26 12:00:00"
+    Image.new("RGB", (300, 200), "green").save(src / "DSC0001.jpg", exif=exif)
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in src.iterdir()}
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("MNTest")
+    app.setApplicationName(f"MNTestExport{os.getpid()}")
+    monkeypatch.setattr(appmod, "logs_dir", lambda: str(tmp_path / "logs"))
+    os.makedirs(tmp_path / "logs", exist_ok=True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    infos = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: infos.append(a[2]))
+
+    w = appmod.MainWindow()
+    w.prefs.set("ollama/host", f"http://127.0.0.1:{srv.server_port}")
+    w.prefs.set("template", "{date} {orig}")
+    w.show()
+    w.resize(1400, 680)
+    w.folder_edit.setText(str(src))
+    w.scan_folder()
+    wait(app, lambda: not w.scanning)
+    w.action_combo.setCurrentIndex(w.action_combo.findData("export"))
+    assert w.export_row.isVisible()
+    assert w.out_edit.text() == str(tmp_path / "Video Staging area (web)")       # default: next to the source
+    w.size_combo.setCurrentIndex(w.size_combo.findData(720))
+    w.thumbs_check.setChecked(True)
+    assert w.apply_btn.text() == "Export 3 files…"
+
+    w.run_action()
+    assert w.exporting
+    wait(app, lambda: not w.exporting, timeout=120)
+    w.grab().save(str(tmp_path.parent / "screenshot-export.png"))
+
+    out = tmp_path / "Video Staging area (web)"
+    got = sorted(p.name for p in out.iterdir())
+    assert got == ["2019-04-16 La Grange 10 Robot Runs.jpg", "2019-04-16 La Grange 10 Robot Runs.mp4",
+                   "2024-12-26 C0001.jpg", "2024-12-26 C0001.mp4", "2024-12-26 DSC0001.jpg"], got
+    v = next(s for s in probe(w.tools, str(out / "2024-12-26 C0001.mp4"))["streams"] if s["codec_type"] == "video")
+    assert (v["codec_name"], v["pix_fmt"], v["width"], v["height"]) == ("h264", "yuv420p", 1280, 720)
+    assert Image.open(out / "2019-04-16 La Grange 10 Robot Runs.jpg").getpixel((5, 5))[0] > 200   # its own orange thumb
+    # originals untouched: same names, same bytes
+    assert {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in src.iterdir()} == before
+    assert all(it.status == "exported" for it in w.model.items)
+    assert "Exported 5 files" in w.status_label.text()
+
+    # running again skips what's there
+    w.run_action()
+    assert infos and "already in the output folder" in infos[-1]
+
+    # undo deletes the copies, leaves originals
+    w.undo_last()
+    assert list(out.iterdir()) == []
+    assert {p.name for p in src.iterdir()} == set(before)
+    w.close()
+    srv.shutdown()
+
+
+def test_split_dv_flow(tmp_path, monkeypatch):
+    from tests.test_dvtape import tape
+    raw, avi = tape(tmp_path, (2, "2007-09-23T21:47:00Z"), (2, "2007-09-24T10:05:30Z"), name="Tape1.avi")
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("MNTest")
+    app.setApplicationName(f"MNTestSplit{os.getpid()}")
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    w = appmod.MainWindow()
+    w.show()
+    out = tmp_path / "recordings"
+    w.split_dv([str(avi)], str(out))
+    assert w.splitting
+    wait(app, lambda: not w.splitting and not w.scanning, timeout=60)
+    assert sorted(os.listdir(out)) == ["Tape1.07-09-23_21-47.00.avi", "Tape1.07-09-24_10-05.30.avi"]
+    # it offered to scan the recordings; dates come from the tape itself
+    assert w.model.root == str(out)
+    got = sorted((it.name, it.date.strftime("%Y-%m-%d %H:%M:%S"), it.date_source) for it in w.model.items)
+    assert got == [("Tape1.07-09-23_21-47.00.avi", "2007-09-23 21:47:00", "tape"),
+                   ("Tape1.07-09-24_10-05.30.avi", "2007-09-24 10:05:30", "tape")]
+    w.close()
+
+
+def test_face_names_reach_the_ai(tmp_path, monkeypatch):
+    from media_namer import faces as facemod
+    from tests.test_faces import FakeEngine, library
+
+    media = tmp_path / "media"
+    media.mkdir()
+    video(media / "IMG_6000.MOV", "2023-10-01T18:00:00Z")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("MNTest")
+    app.setApplicationName(f"MNTestFaces{os.getpid()}")
+
+    class FramesShowSisters(FakeEngine):            # every frame shows Allison and Anika
+        def decode(self, data):
+            return b"Allison,Anika"
+    monkeypatch.setattr(facemod, "models_present", lambda folder: True)
+    monkeypatch.setattr(facemod, "FaceEngine", lambda folder: FramesShowSisters())
+
+    w = appmod.MainWindow()
+    w.people = library(tmp_path)                    # Allison, Anika, Annaclare with reference faces
+    w.prefs.set("ollama/host", f"http://127.0.0.1:{srv.server_port}")
+    w._update_faces_check()
+    assert w.faces_check.isEnabled()
+    w.faces_check.setChecked(True)
+    w.folder_edit.setText(str(media))
+    w.scan_folder()
+    wait(app, lambda: not w.scanning)
+    Fake.calls = 0
+    sent = []
+    orig = Fake.do_POST
+
+    def capture(handler):
+        body = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])))
+        sent.append(body["messages"][0]["content"])
+        b = json.dumps({"message": {"content": "Allison and Anika picking apples in orchard"}}).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Length", str(len(b)))
+        handler.end_headers()
+        handler.wfile.write(b)
+    monkeypatch.setattr(Fake, "do_POST", capture)
+    w.describe_missing()
+    wait(app, lambda: w.pending == 0)
+    it = w.model.items[0]
+    assert "Face recognition identified these people: Allison and Anika" in sent[0]
+    assert "Annaclare" not in sent[0]                # not in the frames, so not mentioned
+    assert it.people == ["Allison", "Anika"]
+    assert it.new_name == "2023-10-01 Allison and Anika picking apples in orchard.mov" or \
+        it.new_name.endswith(" Allison and Anika picking apples in orchard.mov")
+    # turning faces off changes the cache key, so it would ask again
+    k_on = w._cache_key(it)
+    w.faces_check.setChecked(False)
+    assert w._cache_key(it) != k_on
+    w.close()
+    srv.shutdown()
+
+
+def test_people_dialog_smoke(tmp_path):
+    from media_namer.people_dialog import PeopleDialog
+    from tests.test_faces import library
+    app = QApplication.instance() or QApplication([])
+    lib = library(tmp_path, n_refs=2)
+    d = PeopleDialog(lib, str(tmp_path / "models"), 0.40)
+    assert d.people_list.count() == 3 and d.current_name() == "Allison"
+    assert d.photo_list.count() == 2
+    assert d.download_btn.isVisibleTo(d)             # models missing -> offer download
+    d.people_list.setCurrentRow(1)
+    assert d.current_name() == "Anika"
+    d.resize(820, 560)
+    d.show()
+    app.processEvents()
+    d.grab().save(str(tmp_path.parent / "screenshot-people.png"))
+    d.close()

@@ -9,7 +9,9 @@ from __future__ import annotations
 import base64
 import json
 import random
+import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,12 +32,85 @@ class DescribeError(Exception):
 class TransientError(DescribeError):
     """Might succeed on retry (rate limit, server busy, timeout)."""
 
+    def __init__(self, msg: str, retry_after: float = 0.0):
+        super().__init__(msg)
+        self.retry_after = retry_after        # seconds the server asked us to wait
+
+
+class QuotaError(DescribeError):
+    """Daily quota used up, or no quota for this model on this key: retrying today won't help."""
+
+
+def _seconds(text: str) -> float:
+    m = re.search(r"([\d.]+)\s*s", text or "")
+    return float(m.group(1)) if m else 0.0
+
+
+def _quota_details(e) -> tuple[list[str], list[str], float]:
+    """(quota ids, quota values, retry delay) from a Google API error body."""
+    body = getattr(e, "details", None)
+    err = body.get("error", {}) if isinstance(body, dict) else {}
+    ids, values, delay = [], [], 0.0
+    for d in err.get("details", []) or []:
+        kind = str(d.get("@type", ""))
+        if kind.endswith("QuotaFailure"):
+            for v in d.get("violations", []) or []:
+                ids.append(str(v.get("quotaId", "")))
+                values.append(str(v.get("quotaValue", "")))
+        elif kind.endswith("RetryInfo"):
+            delay = _seconds(str(d.get("retryDelay", "")))
+    if not delay:
+        m = re.search(r"retry in ([\d.]+)\s*s", getattr(e, "message", "") or str(e), re.I)
+        delay = float(m.group(1)) if m else 0.0
+    return ids, values, delay
+
+
+class RateLimiter:
+    """Spaces out requests across all worker threads (e.g. 10 per minute = one every 6 s)."""
+
+    _shared: dict[str, "RateLimiter"] = {}
+    _shared_lock = threading.Lock()
+
+    def __init__(self, per_minute: float):
+        self.per_minute = per_minute
+        self.interval = 60.0 / per_minute
+        self._next = 0.0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def shared(cls, key: str, per_minute: float) -> "RateLimiter | None":
+        if per_minute <= 0:
+            return None
+        with cls._shared_lock:
+            lim = cls._shared.get(key)
+            if lim is None or lim.per_minute != per_minute:
+                lim = cls._shared[key] = cls(per_minute)
+            return lim
+
+    def wait(self, cancelled: Callable[[], bool] = lambda: False, sleep: Callable[[float], None] = time.sleep) -> None:
+        with self._lock:
+            slot = max(time.monotonic(), self._next)
+            self._next = slot + self.interval
+        while (remaining := slot - time.monotonic()) > 0:
+            if cancelled():
+                raise Cancelled()
+            sleep(min(0.25, remaining))
+
+    def push_back(self, seconds: float) -> None:
+        """After a rate-limit error, make every thread wait at least this long."""
+        with self._lock:
+            self._next = max(self._next, time.monotonic() + seconds)
+
 
 class Cancelled(Exception):
     pass
 
 
-def build_prompt(kind: str, frame_count: int, context: str = "") -> str:
+def _join_names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def build_prompt(kind: str, frame_count: int, context: str = "", people: list[str] | None = None) -> str:
     what = (f"these {frame_count} frames from one home video" if kind == "video" and frame_count > 1
             else "this frame from a home video" if kind == "video" else "this photo")
     lines = [
@@ -44,6 +119,9 @@ def build_prompt(kind: str, frame_count: int, context: str = "") -> str:
         "Use sentence case. Do not include dates, file extensions, quotes, or ending punctuation.",
         "Do not guess names of people or places unless they appear in the context below.",
     ]
+    if people:
+        lines.append(f"Face recognition identified these people: {_join_names(people)}. "
+                     "Use their names in the title. Do not name anyone else.")
     if context.strip():
         lines.append(f"Context from the family: {context.strip()}")
     lines.append("Reply with the title only.")
@@ -125,8 +203,21 @@ class GeminiBackend:
             return fn()
         except errors.APIError as e:
             code = getattr(e, "code", 0) or 0
-            msg = f"Gemini HTTP {code}: {getattr(e, 'message', '') or e}"
-            if code in (408, 429, 500, 502, 503, 504):
+            text = getattr(e, "message", "") or str(e)
+            msg = f"Gemini HTTP {code}: {text}"
+            if code == 429:
+                ids, values, delay = _quota_details(e)
+                if any("PerDay" in q for q in ids):
+                    raise QuotaError(
+                        f"Gemini's daily limit for {self.model} is used up. It resets at midnight Pacific time. "
+                        "Finish later, switch to another model (↻), use Ollama, or add billing in AI Studio.") from e
+                if "0" in values or re.search(r"limit:\s*0\b", text):
+                    raise QuotaError(
+                        f"{self.model} has no free quota on this API key. Pick another model (↻) "
+                        "or enable billing in AI Studio.") from e
+                raise TransientError(f"Gemini rate limit (too many requests per minute): {text[:160]}",
+                                     retry_after=delay) from e
+            if code in (408, 500, 502, 503, 504):
                 raise TransientError(msg) from e
             raise DescribeError(msg) from e
         except (ConnectionError, TimeoutError, OSError) as e:
@@ -180,6 +271,8 @@ def with_retry(fn: Callable[[], str], attempts: int = 5, base_delay: float = 2.0
             if attempt == attempts:
                 raise
             delay = base_delay * (2 ** (attempt - 1)) * (0.75 + random.random() / 2)
+            if e.retry_after:                       # the server said how long to wait
+                delay = max(delay, e.retry_after + random.random())
             if on_retry:
                 on_retry(attempt, delay, e)
             waited = 0.0
